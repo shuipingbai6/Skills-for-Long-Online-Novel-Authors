@@ -1,15 +1,11 @@
 ---
 name: "create-author"
-description: "Distill a web novel author into an AI Skill. Parse novels/comments/social media, generate Writing Skill + Author Persona, with continuous evolution. | 把网文作者蒸馏成 AI Skill，解析小说/评论/社交媒体，生成写作能力 + 作者人格，支持持续进化。"
+description: "把网文作者蒸馏成 AI Skill，解析小说/评论/社交媒体，生成写作能力 + 作者人格，支持迭代进化。"
 argument-hint: "[author-name-or-slug]"
 version: "1.0.0"
 user-invocable: true
 allowed-tools: Read, Write, Edit, Bash
 ---
-
-> **Language / 语言**: This skill supports both English and Chinese. Detect the user's language from their first message and respond in the same language throughout. Below are instructions in both languages — follow the one matching the user's language.
->
-> 本 Skill 支持中英文。根据用户第一条消息的语言，全程使用同一语言回复。下方提供了两种语言的指令，按用户语言选择对应版本执行。
 
 # 网文作者.skill 创建器（Claude Code 版）
 
@@ -28,6 +24,8 @@ allowed-tools: Read, Write, Edit, Bash
 - "我有新文件" / "追加"
 - "这不对" / "他不会这样" / "他应该是"
 - `/update-author {slug}`
+- `/evolve-author {slug}`（迭代进化）
+- `/validate-author {slug}`（收敛验证）
 
 当用户说 `/list-authors` 时列出所有已生成的作者。
 
@@ -49,6 +47,9 @@ allowed-tools: Read, Write, Edit, Bash
 | 解析公众号文章        | `Bash` → `python3 ${CLAUDE_SKILL_DIR}/tools/wechat_parser.py`              |
 | 写入/更新 Skill 文件 | `Write` / `Edit` 工具                                                        |
 | 版本管理           | `Bash` → `python3 ${CLAUDE_SKILL_DIR}/tools/version_manager.py`            |
+| 智能章节采样       | `Bash` → `python3 ${CLAUDE_SKILL_DIR}/tools/chapter_sampler.py`            |
+| 迭代蒸馏编排       | `Bash` → `python3 ${CLAUDE_SKILL_DIR}/tools/iterative_distill.py`          |
+| 收敛验证           | `Bash` → `python3 ${CLAUDE_SKILL_DIR}/tools/convergence_checker.py`        |
 | 列出已有 Skill     | `Bash` → `python3 ${CLAUDE_SKILL_DIR}/tools/skill_writer.py --action list` |
 
 **基础目录**：Skill 文件写入 `./authors/{slug}/`（相对于本项目目录）。
@@ -223,7 +224,17 @@ mkdir -p authors/{slug}/knowledge/social
   },
   "impression": "{创作印象}",
   "knowledge_sources": [...已导入文件列表],
-  "corrections_count": 0
+  "corrections_count": 0,
+  "evolution": {
+    "total_rounds": 0,
+    "chapters_sampled": [],
+    "rounds": [],
+    "convergence": {
+      "is_converged": false,
+      "last_validation_scores": null,
+      "consecutive_small_gains": 0
+    }
+  }
 }
 ```
 
@@ -280,20 +291,97 @@ user-invocable: true
 
 ---
 
-## 进化模式：追加文件
+## 进化模式：迭代进化
 
-用户提供新文件或文本时：
+当用户说 `/evolve-author {slug}` 或"进化"时，进入迭代进化模式：
 
-1. 按 Step 2 的方式读取新内容
-2. 用 `Read` 读取现有 `authors/{slug}/writing.md` 和 `author_persona.md`
-3. 参考 `${CLAUDE_SKILL_DIR}/prompts/merger.md` 分析增量内容
-4. 存档当前版本（用 Bash）：
+### Round 0：初始化（如该作者尚无 Skill）
+
+1. 询问用户提供小说文件
+2. 使用 `Bash` 采样前 5~10 章：
+   ```bash
+   python3 ${CLAUDE_SKILL_DIR}/tools/chapter_sampler.py --novel {path} --strategy initial --count 5
+   ```
+3. 按 Step 3-5 的流程生成初始 Skill（skill v1）
+4. 在 meta.json 中初始化 `evolution` 字段
+
+### Round N：迭代进化（如该作者已有 Skill）
+
+1. **恢复进化状态**：用 `Read` 读取 `authors/{slug}/meta.json`，获取以下关键信息：
+   - `evolution.total_rounds`：当前已进化轮次（决定下一轮是 Round N+1）
+   - `evolution.chapters_sampled`：已采样章节索引列表（用于 --exclude 参数，避免重复采样）
+   - `evolution.convergence`：收敛状态（如果已收敛，提示用户无需继续进化）
+   - `knowledge_sources`：小说文件路径（如果用户未提供小说路径，使用此路径）
+
+   向用户展示当前状态：
+   ```
+   当前进化状态：
+   - 版本：v{N}
+   - 已进化轮次：{total_rounds}
+   - 已采样章节：{chapters_sampled 列表}
+   - 收敛状态：{已收敛/未收敛}
+   ```
+
+2. **采样策略选择**：
+   - 前 2-3 轮：分层采样（stratified）
+   - 第 3 轮起：不确定性采样（uncertainty）
+
+3. **采样新章节**（5 章）：
+   ```bash
+   python3 ${CLAUDE_SKILL_DIR}/tools/chapter_sampler.py --novel {path} --strategy {stratified/uncertainty} --count 5 --exclude {meta.json中chapters_sampled的值，逗号分隔} --skill-file {skill_dir}/writing.md
+   ```
+
+4. **读取当前 Skill**：用 `Read` 读取 `authors/{slug}/writing.md` 和 `author_persona.md`
+
+5. **重整 Skill**：
+   - 参考 `${CLAUDE_SKILL_DIR}/prompts/merger.md`（重整式更新策略）
+   - 将新章节观察融入已有 Skill，输出重写后的完整 writing.md 和 author_persona.md
+   - **关键：每轮重写，而非追加**
+
+6. **存档当前版本**：
    ```bash
    python3 ${CLAUDE_SKILL_DIR}/tools/version_manager.py --action backup --slug {slug} --base-dir ./authors
    ```
-5. 用 `Edit` 工具追加增量内容到对应文件
-6. 重新生成 `SKILL.md`（合并最新 writing.md + author\_persona.md）
-7. 更新 `meta.json` 的 version 和 updated\_at
+
+7. **写入新 Skill**：用 `Write` 工具重写 writing.md 和 author_persona.md
+
+8. **重新生成 SKILL.md**（合并最新 writing.md + author_persona.md）
+
+9. **更新 meta.json**：
+   - version: v(N+1)
+   - evolution.total_rounds: +1
+   - evolution.chapters_sampled: 追加本轮采样索引
+   - evolution.rounds: 追加本轮记录
+
+10. **展示本轮更新摘要**，等待用户确认是否继续
+
+### 收敛验证
+
+当用户说 `/validate-author {slug}` 或"验证"时：
+
+1. **恢复进化状态**：用 `Read` 读取 `authors/{slug}/meta.json`，确认当前版本和已采样章节
+
+2. **采样验证章节**（3 章，前/中/后各 1 章）：
+   ```bash
+   python3 ${CLAUDE_SKILL_DIR}/tools/convergence_checker.py --action validate --slug {slug} --novel {path} --base-dir ./authors
+   ```
+
+2. **生成骨架大纲**：参考 `${CLAUDE_SKILL_DIR}/prompts/skeleton_outline.md`，从原文提取事件骨架
+
+3. **Skill AI 按大纲写作**：使用当前 Skill 的 AI，根据骨架大纲写一章（**必须用与创建 Skill 不同的 AI**）
+
+4. **对比 AI 多维评分**：将生成文本与原文发送给另一个 AI，按 5 维评分表评分（**必须用与 Skill AI 不同的 AI**）
+   - 参考 `${CLAUDE_SKILL_DIR}/prompts/style_validator.md`
+
+5. **记录评分并判定收敛**：
+   ```bash
+   python3 ${CLAUDE_SKILL_DIR}/tools/convergence_checker.py --action record --slug {slug} --score {综合分} --dimension-scores '{JSON}' --base-dir ./authors
+   python3 ${CLAUDE_SKILL_DIR}/tools/convergence_checker.py --action check --slug {slug} --base-dir ./authors
+   ```
+
+6. **收敛判据**：连续 2 轮迭代，5 维综合评分的提升幅度均 < 0.3，则判定为收敛
+
+7. **详细指南**：参考 `${CLAUDE_SKILL_DIR}/docs/evolution_guide.md`
 
 ---
 
@@ -343,342 +431,3 @@ rm -rf authors/{slug}
 - 题材标签（玄幻、都市、科幻、历史、无限流、仙侠、游戏、灵异）
 
 在 Step 3 分析阶段，需读取该文件将用户填写的标签翻译为具体行为规则。
-
----
-
----
-
-# English Version
-
-# Web Novel Author.skill Creator (Claude Code Edition)
-
-## Trigger Conditions
-
-Activate when the user says any of the following:
-
-- `/create-author`
-- "Help me create an author skill"
-- "I want to distill an author"
-- "New author"
-- "Make a skill for XX"
-
-Enter evolution mode when the user says:
-
-- "I have new files" / "append"
-- "That's wrong" / "He wouldn't do that" / "He should be"
-- `/update-author {slug}`
-
-List all generated authors when the user says `/list-authors`.
-
----
-
-## Tool Usage Rules
-
-This Skill runs in the Claude Code environment with the following tools:
-
-| Task                     | Tool                                                                       |
-| ------------------------ | -------------------------------------------------------------------------- |
-| Read PDF documents       | `Read` tool (native PDF support)                                           |
-| Read image screenshots   | `Read` tool (native image support)                                         |
-| Read MD/TXT files        | `Read` tool                                                                |
-| Parse txt novel files    | `Bash` → `python3 ${CLAUDE_SKILL_DIR}/tools/novel_parser.py`               |
-| Parse epub novel files   | `Bash` → `python3 ${CLAUDE_SKILL_DIR}/tools/epub_parser.py`                |
-| Parse comment data       | `Bash` → `python3 ${CLAUDE_SKILL_DIR}/tools/comment_parser.py`             |
-| Collect Weibo content    | `Bash` → `python3 ${CLAUDE_SKILL_DIR}/tools/weibo_collector.py`            |
-| Parse WeChat articles    | `Bash` → `python3 ${CLAUDE_SKILL_DIR}/tools/wechat_parser.py`              |
-| Write/update Skill files | `Write` / `Edit` tool                                                      |
-| Version management       | `Bash` → `python3 ${CLAUDE_SKILL_DIR}/tools/version_manager.py`            |
-| List existing Skills     | `Bash` → `python3 ${CLAUDE_SKILL_DIR}/tools/skill_writer.py --action list` |
-
-**Base directory**: Skill files are written to `./authors/{slug}/` (relative to the project directory).
-For a global path, use `--base-dir ~/.openclaw/workspace/skills/authors`.
-
----
-
-## Main Flow: Create a New Author Skill
-
-### Step 1: Basic Info Collection (3 questions)
-
-Refer to `${CLAUDE_SKILL_DIR}/prompts/intake.md` for the question sequence. Only ask 3 questions:
-
-1. **Pen name / Codename** (required)
-2. **Basic info** (one sentence: platform, level, masterpiece, gender — say whatever comes to mind)
-   - Example: `Qidian LV5 fantasy writer male masterpiece "Eternal God Emperor"`
-3. **Personality profile** (one sentence: writing style tags, update habit tags, personality tags, genre tags, creative impression)
-   - Example: `water master daily updater fan-pamperer fantasy good at face-slapping`
-
-Everything except the pen name can be skipped. Summarize and confirm before moving to the next step.
-
-### Step 2: Source Material Import
-
-Ask the user how they'd like to provide materials:
-
-```
-How would you like to provide source materials?
-
-  [A] Upload Files
-      txt / epub novel files
-      Comment export files (Qidian/Jinjiang/Fanqie)
-      Weibo/WeChat article screenshots or exports
-
-  [B] Manual Import
-      Provide novel file path
-      Provide comment link (manual collection needed)
-
-  [C] Paste Text
-      Copy-paste text directly
-
-Can mix and match, or skip entirely (generate from manual info only).
-```
-
----
-
-#### Option A: Upload Files
-
-- **PDF / Images**: `Read` tool directly
-- **txt novel files**:
-  ```bash
-  python3 ${CLAUDE_SKILL_DIR}/tools/novel_parser.py --file {path} --output /tmp/novel_out.txt
-  ```
-  Then `Read /tmp/novel_out.txt`
-- **epub novel files**:
-  ```bash
-  python3 ${CLAUDE_SKILL_DIR}/tools/epub_parser.py --file {path} --output /tmp/epub_out.txt
-  ```
-  Then `Read /tmp/epub_out.txt`
-- **Comment export files**:
-  ```bash
-  python3 ${CLAUDE_SKILL_DIR}/tools/comment_parser.py --file {path} --platform {qidian/jinjiang/fanqie} --output /tmp/comment_out.txt
-  ```
-  Then `Read /tmp/comment_out.txt`
-- **Weibo export**:
-  ```bash
-  python3 ${CLAUDE_SKILL_DIR}/tools/weibo_collector.py --file {path} --output /tmp/weibo_out.txt
-  ```
-  Then `Read /tmp/weibo_out.txt`
-- **WeChat article export**:
-  ```bash
-  python3 ${CLAUDE_SKILL_DIR}/tools/wechat_parser.py --file {path} --output /tmp/wechat_out.txt
-  ```
-  Then `Read /tmp/wechat_out.txt`
-- **Markdown / TXT**: `Read` tool directly
-
----
-
-#### Option B: Manual Import
-
-When user provides file paths, use the corresponding parsing tools to read.
-
----
-
-#### Option C: Paste Text
-
-User-pasted content is used directly as text material. No tools needed.
-
----
-
-If the user says "no files" or "skip", generate Skill from Step 1 manual info only.
-
-### Step 3: Analyze Source Material
-
-Combine all collected materials and user-provided info, analyze along two tracks:
-
-**Track A (Writing Skill)**:
-
-- Refer to `${CLAUDE_SKILL_DIR}/prompts/writing_analyzer.md` for extraction dimensions
-- Extract: narrative style, plot construction, character creation, world-building, update habits
-- Emphasize different aspects by genre type (fantasy/urban/scifi/history/infinite)
-
-**Track B (Author Persona)**:
-
-- Refer to `${CLAUDE_SKILL_DIR}/prompts/author_persona_analyzer.md` for extraction dimensions
-- Translate user-provided tags into concrete behavior rules (see tag translation table)
-- Extract from materials: communication style, creative philosophy, interaction behavior
-
-### Step 4: Generate and Preview
-
-Use `${CLAUDE_SKILL_DIR}/prompts/writing_builder.md` to generate Writing Skill content.
-Use `${CLAUDE_SKILL_DIR}/prompts/author_persona_builder.md` to generate Author Persona content (5-layer structure).
-
-Show the user a summary (5-8 lines each), ask:
-
-```
-Writing Skill Summary:
-  - Narrative style: {xxx}
-  - Plot construction: {xxx}
-  - Character creation: {xxx}
-  ...
-
-Author Persona Summary:
-  - Core personality: {xxx}
-  - Communication style: {xxx}
-  - Interaction behavior: {xxx}
-  ...
-
-Confirm generation? Or need adjustments?
-```
-
-### Step 5: Write Files
-
-After user confirmation, execute the following:
-
-**1. Create directory structure** (Bash):
-
-```bash
-mkdir -p authors/{slug}/versions
-mkdir -p authors/{slug}/knowledge/novels
-mkdir -p authors/{slug}/knowledge/comments
-mkdir -p authors/{slug}/knowledge/social
-```
-
-**2. Write writing.md** (Write tool):
-Path: `authors/{slug}/writing.md`
-
-**3. Write author\_persona.md** (Write tool):
-Path: `authors/{slug}/author_persona.md`
-
-**4. Write meta.json** (Write tool):
-Path: `authors/{slug}/meta.json`
-Content:
-
-```json
-{
-  "name": "{pen_name}",
-  "slug": "{slug}",
-  "created_at": "{ISO_timestamp}",
-  "updated_at": "{ISO_timestamp}",
-  "version": "v1",
-  "profile": {
-    "platform": "{platform}",
-    "level": "{level}",
-    "masterpiece": "{masterpiece}",
-    "gender": "{gender}"
-  },
-  "tags": {
-    "writing_style": [...],
-    "update_habit": [...],
-    "personality": [...],
-    "genre": [...]
-  },
-  "impression": "{creative_impression}",
-  "knowledge_sources": [...imported file list],
-  "corrections_count": 0
-}
-```
-
-**5. Generate full SKILL.md** (Write tool):
-Path: `authors/{slug}/SKILL.md`
-
-SKILL.md structure:
-
-```markdown
----
-name: author-{slug}
-description: {pen_name}, {platform} {level} {masterpiece}
-user-invocable: true
----
-
-# {pen_name}
-
-{platform} {level} {masterpiece}{append gender if available}
-
----
-
-## PART A: Writing Capabilities
-
-{full writing.md content}
-
----
-
-## PART B: Author Persona
-
-{full author_persona.md content}
-
----
-
-## Execution Rules
-
-1. PART B decides first: what attitude to take on this task?
-2. PART A executes: use your writing skills to complete the task
-3. Always maintain PART B's communication style in output
-4. PART B Layer 0 rules have the highest priority and must never be violated
-```
-
-Inform user:
-
-```
-Author Skill created!
-
-Location: authors/{slug}/
-Commands: /{slug} (full version)
-          /{slug}-writing (writing capabilities only)
-          /{slug}-persona (author persona only)
-
-If something feels off, just say "he wouldn't do that" and I'll update it.
-```
-
----
-
-## Evolution Mode: Append Files
-
-When user provides new files or text:
-
-1. Read new content using Step 2 methods
-2. `Read` existing `authors/{slug}/writing.md` and `author_persona.md`
-3. Refer to `${CLAUDE_SKILL_DIR}/prompts/merger.md` for incremental analysis
-4. Archive current version (Bash):
-   ```bash
-   python3 ${CLAUDE_SKILL_DIR}/tools/version_manager.py --action backup --slug {slug} --base-dir ./authors
-   ```
-5. Use `Edit` tool to append incremental content to relevant files
-6. Regenerate `SKILL.md` (merge latest writing.md + author\_persona.md)
-7. Update `meta.json` version and updated\_at
-
----
-
-## Evolution Mode: Conversation Correction
-
-When user expresses "that's wrong" / "he should be":
-
-1. Refer to `${CLAUDE_SKILL_DIR}/prompts/correction_handler.md` to identify correction content
-2. Determine if it belongs to Writing (style/plot) or Persona (personality/interaction)
-3. Generate correction record
-4. Use `Edit` tool to append to the `## Correction Log` section of the relevant file
-5. Regenerate `SKILL.md`
-
----
-
-## Management Commands
-
-`/list-authors`:
-
-```bash
-python3 ${CLAUDE_SKILL_DIR}/tools/skill_writer.py --action list --base-dir ./authors
-```
-
-`/author-rollback {slug} {version}`:
-
-```bash
-python3 ${CLAUDE_SKILL_DIR}/tools/version_manager.py --action rollback --slug {slug} --version {version} --base-dir ./authors
-```
-
-`/delete-author {slug}`:
-After confirmation:
-
-```bash
-rm -rf authors/{slug}
-```
-
----
-
-## Tag Translation Table
-
-The tag translation table is maintained separately at `${CLAUDE_SKILL_DIR}/tag_translations.md`.
-
-This file contains mappings from the following four tag categories to Layer 0 behavior rules:
-- Writing style tags (water master, plot-tight, slow-burn, power-fantasy, angst, farming, OP-MC, mortal-MC)
-- Update habit tags (daily updater, weekly updater, monthly updater, hiatus-prone, burst writer, steady)
-- Personality tags (sharp-tongued, fan-pamperer, aloof, self-deprecating, jokester, serious, tsundere, zen)
-- Genre tags (fantasy, urban, scifi, historical, infinite, xianxia, game, horror)
-
-During Step 3 analysis, read this file to translate user-provided tags into concrete behavior rules.

@@ -266,6 +266,16 @@ def create_skill(
     meta["updated_at"] = now
     meta["version"] = "v1"
     meta.setdefault("corrections_count", 0)
+    meta.setdefault("evolution", {
+        "total_rounds": 0,
+        "chapters_sampled": [],
+        "rounds": [],
+        "convergence": {
+            "is_converged": False,
+            "last_validation_scores": None,
+            "consecutive_small_gains": 0,
+        },
+    })
 
     atomic_write(
         skill_dir / "meta.json",
@@ -281,8 +291,15 @@ def update_skill(
     writing_patch: Optional[str] = None,
     persona_patch: Optional[str] = None,
     correction: Optional[dict] = None,
+    writing_full: Optional[str] = None,
+    persona_full: Optional[str] = None,
 ) -> str:
-    """更新现有 Skill，先存档当前版本，再写入更新"""
+    """更新现有 Skill，先存档当前版本，再写入更新
+
+    支持两种更新模式：
+    - 追加模式（旧）：提供 writing_patch / persona_patch，追加到现有内容末尾
+    - 重写模式（新）：提供 writing_full / persona_full，完全替换现有内容
+    """
 
     # 路径校验：skill_dir 必须在 base_dir 下
     if not skill_dir.resolve().is_relative_to(base_dir.resolve()):
@@ -313,12 +330,16 @@ def update_skill(
         if src.exists():
             shutil.copy2(src, version_dir / fname)
 
-    if writing_patch:
+    if writing_full:
+        atomic_write(skill_dir / "writing.md", writing_full)
+    elif writing_patch:
         current_writing = (skill_dir / "writing.md").read_text(encoding="utf-8")
         new_writing = current_writing + "\n\n" + writing_patch
         atomic_write(skill_dir / "writing.md", new_writing)
 
-    if persona_patch or correction:
+    if persona_full:
+        atomic_write(skill_dir / "author_persona.md", persona_full)
+    elif persona_patch or correction:
         current_persona = (skill_dir / "author_persona.md").read_text(encoding="utf-8")
         new_persona = current_persona
 
@@ -374,6 +395,54 @@ def update_skill(
     return new_version
 
 
+def update_evolution(
+    skill_dir: Path,
+    round_num: int,
+    sampled_indices: list[int],
+    strategy: str,
+    updated_dimensions: list[str],
+    validation_score: Optional[float] = None,
+) -> None:
+    """更新 meta.json 中的 evolution 字段"""
+    meta_path = skill_dir / "meta.json"
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+
+    if "evolution" not in meta:
+        meta["evolution"] = {
+            "total_rounds": 0,
+            "chapters_sampled": [],
+            "rounds": [],
+            "convergence": {
+                "is_converged": False,
+                "last_validation_scores": None,
+                "consecutive_small_gains": 0,
+            },
+        }
+
+    evo = meta["evolution"]
+    current_version = meta.get("version", "v1")
+
+    evo["total_rounds"] = round_num
+    evo["chapters_sampled"] = sorted(
+        set(evo.get("chapters_sampled", []) + sampled_indices)
+    )
+
+    round_record = {
+        "round": round_num,
+        "chapters": sampled_indices,
+        "sampling_strategy": strategy,
+        "version_before": current_version,
+        "version_after": f"v{int(current_version.removeprefix('v').split('_')[0]) + 1}",
+        "updated_dimensions": updated_dimensions,
+        "validation_score": validation_score,
+        "timestamp": utc_now_iso(),
+    }
+    evo["rounds"].append(round_record)
+
+    meta["evolution"] = evo
+    atomic_write(meta_path, json.dumps(meta, ensure_ascii=False, indent=2))
+
+
 def list_authors(base_dir: Path) -> list[dict]:
     """列出所有已创建的作者 Skill"""
     authors = []
@@ -416,6 +485,8 @@ def main() -> None:
     parser.add_argument("--persona", help="author_persona.md 内容文件路径")
     parser.add_argument("--writing-patch", help="writing.md 增量更新内容文件路径")
     parser.add_argument("--persona-patch", help="author_persona.md 增量更新内容文件路径")
+    parser.add_argument("--writing-full", help="writing.md 完整重写内容文件路径（迭代进化模式）")
+    parser.add_argument("--persona-full", help="author_persona.md 完整重写内容文件路径（迭代进化模式）")
     parser.add_argument(
         "--correction-wrong",
         help="correction：不应该出现的行为",
@@ -505,6 +576,8 @@ def main() -> None:
 
         writing_patch = Path(args.writing_patch).read_text(encoding="utf-8") if args.writing_patch else None
         persona_patch = Path(args.persona_patch).read_text(encoding="utf-8") if args.persona_patch else None
+        writing_full = Path(args.writing_full).read_text(encoding="utf-8") if args.writing_full else None
+        persona_full = Path(args.persona_full).read_text(encoding="utf-8") if args.persona_full else None
 
         # 构建 correction 字典
         correction = None
@@ -524,6 +597,7 @@ def main() -> None:
         try:
             new_version = update_skill(
                 skill_dir, base_dir, writing_patch, persona_patch, correction,
+                writing_full, persona_full,
             )
         except (ValueError, OSError, FileExistsError) as e:
             print(f"错误：更新失败 - {e}", file=sys.stderr)
